@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百合会(bbs.yamibo.com)小说漫画帖下载器
 // @namespace    yamibo-dl
-// @version      0.3.2
+// @version      0.3.3
 // @description  单帖导出漫画ZIP/小说TXT/EPUB；板块列表批量队列下载（L1+L2）
 // @author       Lciop
 // @downloadURL  https://raw.githubusercontent.com/Lciop37/yamibo-dl/main/yamibo-dl.user.js
@@ -42,6 +42,9 @@ const CFG_DEFAULTS = {
   imgMode: "pack",     // pack=整帖ZIP/CBZ | direct=逐张直接下载
   novelMode: "author", // author=只看楼主 | all=全部楼层
   novelFormat: "txt",  // txt | epub
+  pageFrom: 1,         // 页区间起（0=全部）
+  pageTo: 0,           // 页区间止（0=全部）
+  stopOnError: true,   // 遇错即停：连续 405 时不再机械重试、中止任务
 };
 const LS_KEY = "yamibo_dl_state_v1";
 let cfg = loadCfg();
@@ -53,6 +56,20 @@ function saveCfg() { try { GM_setValue(LS_KEY, JSON.stringify(cfg)); } catch (e)
 
 /* ================= 基础工具 ================= */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 可中断等待：面板按下停止则抛 AbortError；超过 1 秒的等待切片轮询，"停止"秒级生效而非死等整段
+function sleepAbort(ms, panel) {
+  return new Promise((resolve, reject) => {
+    let left = ms;
+    const tick = () => {
+      if (panel && panel._stop) return reject(new AbortError());
+      left -= 1000;
+      if (left <= 0) return resolve();
+      if (panel && ms >= 5000) say(panel, "等待中，剩余 " + Math.ceil(left / 1000) + " 秒（可点停止）");
+      setTimeout(tick, 1000);
+    };
+    setTimeout(tick, Math.min(1000, ms));
+  });
+}
 const S = (v) => (v == null ? "" : String(v));
 
 // GM_xmlhttpRequest 回调式 → Promise 包装（兼容真实 Tampermonkey，它不返回 Promise）
@@ -78,12 +95,13 @@ async function xhr(url, asBlob) {
       if (attempt < 1) { await sleep(3000); continue; }
       throw e;
     }
-    const st = res.status;
-    if ((st === 405 || st === 403) && attempt < 2) {
-      const wait = 45000 * (attempt + 1);
-      console.warn("[yamibo-dl] 触发站点反爬(" + st + ")，" + (wait / 1000) + " 秒后自动重试: " + url);
-      await sleep(wait);
-      continue;
+      const st = res.status;
+      if ((st === 405 || st === 403) && attempt < 2) {
+        if (cfg.stopOnError) throw new Error("触发反爬(" + st + ")，出错即停已开启：稍候再试，或用页区间分段下载");
+        const wait = 45000 * (attempt + 1);
+        console.warn("[yamibo-dl] 触发站点反爬(" + st + ")，" + (wait / 1000) + " 秒后自动重试: " + url);
+        await sleepAbort(wait, RUN.panel);
+        continue;
     }
     return res;
   }
@@ -125,6 +143,12 @@ async function fetchBlobUrl(url) {
   if (!blob || !blob.size) throw new Error("空响应 @ " + url);
   return blob;
 }
+
+/* 任务中断：AbortError 在批量队列中按"跳过"处理，不触发反爬重试 */
+class AbortError extends Error {}
+const isAbort = (e) => e && e.name === "AbortError";
+/* 当前运行面板：xhr 反爬退避等待期间据此响应"停止" */
+let RUN = { panel: null };
 
 /* ================= 帖子解析 ================= */
 function parseThreadPage(doc) {
@@ -190,20 +214,32 @@ function collectImages(doc) {
   return imgs;
 }
 
-/* 并发执行 */
-async function runPool(items, size, worker, onItem) {
+/* 并发执行；opts.panel 设置后可中途停止（AbortError 优先向上抛，runPool 的兜底捕获不会吞掉它） */
+async function runPool(items, size, worker, onItem, opts) {
+  opts = opts || {};
+  const panel = opts.panel;
   const queue = items.map((it, i) => ({ it, i }));
   const results = new Array(items.length);
-  let failed = 0;
+  let failed = 0, aborted = false;
   const runners = new Array(Math.max(1, Math.min(size, queue.length))).fill(0).map(async () => {
     while (queue.length) {
+      if (panel && panel._stop) { aborted = true; throw new AbortError(); }
       const { it, i } = queue.shift();
       try { results[i] = await worker(it, i); }
-      catch (e) { failed++; results[i] = { error: String(e && e.message || e) }; }
+      catch (e) {
+        if (e && e.name === "AbortError") throw e;
+        failed++; results[i] = { error: String((e && e.message) || e) };
+      }
       if (onItem) onItem(i, it, results[i]);
     }
   });
-  await Promise.all(runners);
+  try {
+    await Promise.all(runners);
+  } catch (e) {
+    // 中止/异常时其余 runner 的二次拒绝挂上空 catch，避免未处理拒绝
+    for (const r of runners) r.catch(() => {});
+    throw e;
+  }
   return { results, failed };
 }
 
@@ -295,11 +331,12 @@ const YD = window.YD = {
   cleanName, threadTitle, htmlToText, buildNovelTxt, packThreadZip, runPool,
   extOf, pageUrl, parseThreadHref, sleep, buildEpub, escXml, collectPostImages,
 
-  async extractThreadImages(tid, pages, onProgress) {
+  async extractThreadImages(tid, from, to, onProgress, panel) {
     const out = [];
     const seen = new Set();
     let formhash = "";
-    for (let p = 1; p <= pages; p++) {
+    for (let p = from; p <= to; p++) {
+      if (panel && panel._stop) throw new AbortError();
       const doc = await fetchDoc(pageUrl(tid, p));
       if (!formhash) {
         formhash = S(doc.querySelector("input[name='formhash']") ? doc.querySelector("input[name='formhash']").value : "")
@@ -308,15 +345,16 @@ const YD = window.YD = {
       for (const im of collectImages(doc)) {
         if (!seen.has(im.url)) { seen.add(im.url); out.push(im); }
       }
-      if (onProgress) onProgress(p, pages, out.length);
-      if (p < pages) await sleep(cfg.delayMs);
+      if (onProgress) onProgress(p, from, to, out.length);
+      if (p < to) await sleepAbort(cfg.delayMs, panel);
     }
     return { images: out, formhash };
   },
 
-  async extractThreadText(tid, pages, author, mode, onProgress) {
+  async extractThreadText(tid, from, to, author, mode, onProgress, panel) {
     const floors = [];
-    for (let p = 1; p <= pages; p++) {
+    for (let p = from; p <= to; p++) {
+      if (panel && panel._stop) throw new AbortError();
       const doc = await fetchDoc(pageUrl(tid, p));
       const posts = parseThreadPage(doc).posts;
       for (const post of posts) {
@@ -325,8 +363,8 @@ const YD = window.YD = {
         if (text.replace(/\[图\]\([^)]*\)/g, "").trim().length < 30) continue; // 跳过水楼/纯表情
         floors.push({ pid: post.pid, author: post.author, html: text, images: collectPostImages(post.el) });
       }
-      if (onProgress) onProgress(p, pages, floors.length);
-      if (p < pages) await sleep(cfg.delayMs);
+      if (onProgress) onProgress(p, from, to, floors.length);
+      if (p < to) await sleepAbort(cfg.delayMs, panel);
     }
     return floors;
   },
@@ -398,8 +436,12 @@ async function buildEpub(title, author, sourceUrl, floors, imgMap) {
   zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
   zip.file("META-INF/container.xml",
     '<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>');
+  // OPF 若声明封面引用则该项必须存在于 manifest（某些校验器按引用强制检查）：
+  // 只有 map 里恰好有名为 cover-image 的项才声明，否则不写（当前生成逻辑本就不会产生该文件名）
+  const hasCover = Object.keys(map).some((u) => map[u] && map[u].file === "cover-image");
   const manifest = chs.map((c, i) => '<item id="c' + (i + 1) + '" href="text/' + c.file + '" media-type="application/xhtml+xml"/>').join("\n    ") +
-    (imgFiles.length ? "\n    " + imgFiles.map((it, i) => '<item id="im' + (i + 1) + '" href="' + it.file + '" media-type="' + it.type + '"/>').join("\n    ") : "");
+    (imgFiles.length ? "\n    " + imgFiles.map((it, i) => '<item id="im' + (i + 1) + '" href="' + it.file + '" media-type="' + it.type + '"/>').join("\n    ") : "") +
+    (hasCover ? "\n    <item id=\"cover-image\" href=\"images/cover.jpg\" media-type=\"image/jpeg\" properties=\"cover-image\"/>" : "");
   const spine = chs.map((c, i) => '<itemref idref="c' + (i + 1) + '"/>').join("\n      ");
   zip.file("OEBPS/content.opf",
     '<?xml version="1.0" encoding="UTF-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookID" version="3.1" xmlns:epub="http://www.idpf.org/2007/ops" generator="yamibo-dl">\n' +
@@ -468,33 +510,38 @@ async function runMangaThread(tid, opts) {
   const doc0 = await fetchDoc(pageUrl(tid, 1));
   const info = parseThreadPage(doc0);
   const title = threadTitle(doc0);
-  const pages = Math.min(info.maxPage, opts.pageCap || 1000);
-  say(panel, "《" + title + "》共 " + pages + " 页，解析图片…");
-  const ex = await YD.extractThreadImages(tid, pages, (p, n, c) => say(panel, "翻页 " + p + "/" + n + "，累计图片 " + c));
-  if (!ex.images.length) { say(panel, "未找到图片（可能是文字帖，改用小说模式）"); return { images: 0 }; }
+  const from = Math.max(1, opts.pageFrom || 1);
+  const to = Math.min(opts.pageTo ? Math.min(opts.pageTo, info.maxPage) : info.maxPage, info.maxPage);
+  if (from > to) { say(panel, "页区间无效：第 " + from + " 页已超出本帖范围（共 " + info.maxPage + " 页）"); return { images: 0 }; }
+  const span = to - from + 1;
+  say(panel, "《" + title + "》共 " + info.maxPage + " 页，本次取 " + from + "~" + to + "（" + span + " 页），解析图片…");
+  const ex = await YD.extractThreadImages(tid, from, to, (p, a, b, c) => say(panel, "翻页 " + p + "（" + (p - a + 1) + "/" + span + "），累计图片 " + c), panel);
+  if (!ex.images.length) { say(panel, "所选页区间内未找到图片"); return { images: 0 }; }
   say(panel, "开始下载 " + ex.images.length + " 张图…");
   const prog = { done: 0, failed: 0 };
   const { results } = await runPool(ex.images, cfg.concurrency,
     (im) => fetchBlobUrl(im.url),
-    (i, it, res) => { prog.done++; if (res && res.error) prog.failed++; say(panel, "图片 " + prog.done + "/" + ex.images.length + (prog.failed ? "（失败 " + prog.failed + "）" : "")); });
+    (i, it, res) => { prog.done++; if (res && res.error) prog.failed++; say(panel, "图片 " + prog.done + "/" + ex.images.length + (prog.failed ? "（失败 " + prog.failed + "）" : "")); },
+    { panel });
   const failed = prog.failed;
   if (cfg.imgMode === "direct") {
     ex.images.forEach((im, i) => {
       try {
-        GM_download({ url: im.url, name: "yamibo/" + title + "/" + String(i + 1).padStart(3, "0") + extOf(im.url, results[i] && results[i].type) });
+        GM_download({ url: im.url, name: "yamibo/" + title + "/p" + from + "-" + to + "/" + String(i + 1).padStart(3, "0") + extOf(im.url, results[i] && results[i].type) });
       } catch (e) {}
     });
     say(panel, "已发起逐张下载 " + ex.images.length + " 张（首次请允许“下载多个文件”）");
   } else {
     let zip;
     try {
-      zip = await packThreadZip(title, ex.images, results, ["标题: " + title, "地址: " + pageUrl(tid, 1)]);
+      zip = await packThreadZip(title, ex.images, results,
+        ["标题: " + title, "地址: " + pageUrl(tid, from), "页区间: " + from + "-" + to + "（本帖共 " + info.maxPage + " 页）"]);
     } catch (e) {
       say(panel, "ZIP 写入失败: " + String((e && e.message) || e)); throw e;
     }
     say(panel, "正在打包…");
     const blob = await generateZipBlob(zip, panel, "打包");
-    saveBlob(title + ".zip", blob, panel);
+    saveBlob(span < info.maxPage ? title + "_p" + from + "-" + to + ".zip" : title + ".zip", blob, panel);
   }
   say(panel, "完成（失败 " + failed + "）");
   return { images: ex.images.length };
@@ -506,16 +553,20 @@ async function runNovelThread(tid, opts) {
   const doc0 = await fetchDoc(pageUrl(tid, 1));
   const info = parseThreadPage(doc0);
   const title = threadTitle(doc0);
-  const p0 = parseThreadPage(doc0);
-  const author = (p0.posts[0] && p0.posts[0].author) || "";
+  const author = (info.posts[0] && info.posts[0].author) || "";
   const mode = cfg.novelMode;
-  const pages = Math.min(info.maxPage, opts.pageCap || (mode === "all" ? 200 : 1000));
-  say(panel, "《" + title + "》共 " + info.maxPage + " 页，模式：" + (mode === "author" ? "只看楼主(" + (author || "?") + ")" : "全部楼层") + (pages < info.maxPage ? "，截取前 " + pages + " 页" : ""));
-  const floors = await YD.extractThreadText(tid, pages, author, mode, (p, n, f) => say(panel, "翻页 " + p + "/" + n + "，已提取 " + f + " 楼"));
+  const defTo = mode === "all" ? 200 : 1000; // 沿用原页数上限作"留空=全部"的兜底
+  const from = Math.max(1, opts.pageFrom || 1);
+  const to = Math.min(opts.pageTo ? Math.min(opts.pageTo, info.maxPage) : Math.min(defTo, info.maxPage), info.maxPage);
+  if (from > to) { say(panel, "页区间无效：第 " + from + " 页已超出本帖范围（共 " + info.maxPage + " 页）"); return { floors: 0 }; }
+  const span = to - from + 1;
+  say(panel, "《" + title + "》共 " + info.maxPage + " 页，本次取 " + from + "~" + to + "，模式：" + (mode === "author" ? "只看楼主(" + (author || "?") + ")" : "全部楼层"));
+  const floors = await YD.extractThreadText(tid, from, to, author, mode, (p, a, b, f) => say(panel, "翻页 " + p + "（" + (p - a + 1) + "/" + span + "），已提取 " + f + " 楼"), panel);
   const totalChars = floors.reduce((a, f) => a + S(f.html).length, 0);
   if (cfg.novelFormat === "epub") {
     const allUrls = [];
     floors.forEach((f) => (f.images || []).forEach((u) => { if (allUrls.indexOf(u) < 0) allUrls.push(u); }));
+    if (allUrls.length > 300) say(panel, "提示：本次含插图 " + allUrls.length + " 张，内存占用较大；可缩小页区间分批导出");
     const map = {};
     if (allUrls.length) {
       say(panel, "下载插图 " + allUrls.length + " 张…");
@@ -526,7 +577,8 @@ async function runNovelThread(tid, opts) {
           done++;
           if (done % 3 === 0 || done === allUrls.length) say(panel, "插图 " + done + "/" + allUrls.length);
           if (res && !res.error && res.size) map[u] = { file: "images/img" + Object.keys(map).length + extOf(u, res.type), blob: res, type: res.type || "image/jpeg" };
-        });
+        },
+        { panel });
       say(panel, "插图就绪 " + Object.keys(map).length + "/" + allUrls.length + "，生成 EPUB（" + floors.length + " 章）…");
     } else {
       say(panel, "生成 EPUB（" + floors.length + " 章）…");
@@ -548,7 +600,7 @@ async function runNovelThread(tid, opts) {
     say(panel, "打包完成（" + blob.size + " 字节），保存下载…");
     saveBlob(title + ".epub", blob, panel);
   } else {
-    const txt = buildNovelTxt(title + "（" + pageUrl(tid, 1) + "）", floors);
+    const txt = buildNovelTxt(title + "（" + pageUrl(tid, from) + "）", floors);
     saveBlob(title + ".txt", new Blob(["\uFEFF" + txt], { type: "text/plain;charset=utf-8" }), panel);
   }
   say(panel, "完成：" + floors.length + " 楼，约 " + Math.round(totalChars / 1000) + "K 字");
@@ -582,33 +634,43 @@ function injectUI() {
       panel = el("div", "yd-panel");
       panel.innerHTML = "<h3>下载本帖</h3>" +
         '<div>类型 <label><input type="radio" name="yd-kind" value="manga" checked>漫画(图包)</label>' +
-        '<label><input type="radio" name="yd-kind" value="novel">小说(TXT)</label></div>' +
-        '<div>图片 <label><input type="radio" name="yd-img" value="pack" checked>ZIP打包</label>' +
-        '<label><input type="radio" name="yd-img" value="direct">逐张直下</label></div>' +
+        '<label><input type="radio" name="yd-kind" value="novel">小说(TXT/EPUB)</label></div>' +
+        '<div>图片 <select name="yd-img"><option value="pack">ZIP 打包</option><option value="direct">逐张直下</option></select>' +
+        '（仅漫画类型生效）</div>' +
         '<div>小说 <label><input type="radio" name="yd-mode" value="author" checked>只看楼主</label>' +
-        '<label><input type="radio" name="yd-mode" value="all">全部楼层</label>' +
-        '<label>页数上限 <input type="number" name="yd-cap" value="30" min="1" style="width:52px"></label></div>' +
+        '<label><input type="radio" name="yd-mode" value="all">全部楼层</label></div>' +
         '<div>格式 <label><input type="radio" name="yd-fmt" value="txt" checked>TXT</label>' +
         '<label><input type="radio" name="yd-fmt" value="epub">EPUB（每楼一章）</label></div>' +
+        '<div>页区间 第 <input type="number" name="yd-pf" value="' + (cfg.pageFrom || 1) + '" min="1" style="width:48px"> 页至 <input type="number" name="yd-pt" value="' + (cfg.pageTo || "") + '" min="1" style="width:48px" placeholder="空"> 页' +
+        '<label style="margin-left:10px"><input type="checkbox" name="yd-soe"' + (cfg.stopOnError !== false ? " checked" : "") + ">出错即停</label></div>" +
         '<div style="margin-top:8px"><button class="yd-btn" data-act="go">开始</button> <button class="yd-btn sec" data-act="stop">停止</button></div>' +
-        '<div class="yd-log">就绪</div>';
+        '<div class="yd-log">页数留空 = 取到帖尾；防 405 建议单次不超过约 30 页，分区间分批下载</div>';
       document.body.appendChild(panel);
+      panel.querySelector("[name=yd-img]").value = cfg.imgMode === "direct" ? "direct" : "pack";
       panel._stop = false;
-      panel.querySelector('[data-act=stop]').onclick = () => { panel._stop = true; say(panel, "已请求停止（当前阶段结束后生效）"); };
+      panel.querySelector('[data-act=stop]').onclick = () => { panel._stop = true; say(panel, "正在停止：当前页/张完成后中止"); };
       panel.querySelector('[data-act=go]').onclick = async () => {
         const kind = panel.querySelector('[name=yd-kind]:checked').value;
-        cfg.imgMode = panel.querySelector('[name=yd-img]:checked').value;
+        cfg.imgMode = panel.querySelector("[name=yd-img]").value;
         cfg.novelMode = panel.querySelector('[name=yd-mode]:checked').value;
         const fmtEl = panel.querySelector('[name=yd-fmt]:checked');
         if (fmtEl) cfg.novelFormat = fmtEl.value;
-        const cap = +panel.querySelector("[name=yd-cap]").value || 30;
+        const pf = +panel.querySelector("[name=yd-pf]").value;
+        const pt = +panel.querySelector("[name=yd-pt]").value;
+        cfg.pageFrom = pf > 0 ? pf : 0;
+        cfg.pageTo = pt > 0 ? pt : 0;
+        cfg.stopOnError = panel.querySelector("[name=yd-soe]").checked;
         saveCfg();
         const tid = (location.pathname.match(/thread-(\d+)-/) || [])[1] ||
           (location.search.match(/[?&]tid=(\d+)/) || [])[1];
+        panel._stop = false; // 每次开始重置停止标志
+        RUN.panel = panel;
         try {
-          if (kind === "manga") await runMangaThread(tid, { panel, pageCap: cap });
-          else await runNovelThread(tid, { panel, pageCap: cap });
-        } catch (e) { say(panel, "出错: " + String((e && e.message) || e)); }
+          const o = { panel, pageFrom: cfg.pageFrom || 1, pageTo: cfg.pageTo || 0 };
+          if (kind === "manga") await runMangaThread(tid, o);
+          else await runNovelThread(tid, o);
+        } catch (e) { say(panel, isAbort(e) ? "已停止（未生成文件）" : "出错: " + String((e && e.message) || e)); }
+        finally { RUN.panel = null; }
       };
     };
     document.body.appendChild(fab);
@@ -629,10 +691,11 @@ function injectUI() {
       }).filter(Boolean);
       const uniq = [...new Map(rows.map((r) => [r.tid, r])).values()];
       panel.innerHTML = "<h3>本页帖子（" + uniq.length + "）</h3>" +
-        '<div><button class="yd-btn" data-act="all">全选</button> <button class="yd-btn sec" data-act="none">清空</button>' +
-        ' <label>每帖页数上限 <input type="number" name="yd-cap" value="10" min="1" style="width:48px"></label></div>' +
+        '<div><button class="yd-btn" data-act="all">全选</button> <button class="yd-btn sec" data-act="none">清空</button></div>' +
         '<div>小说格式 <label><input type="radio" name="yd-bfmt" value="txt" checked>TXT</label>' +
         '<label><input type="radio" name="yd-bfmt" value="epub">EPUB</label></div>' +
+        '<div>每帖页区间 第 <input type="number" name="yd-pf" value="1" min="1" style="width:48px"> 页至 <input type="number" name="yd-pt" value="10" min="1" style="width:48px" placeholder="空"> 页' +
+        '<label style="margin-left:10px"><input type="checkbox" name="yd-soe"' + (cfg.stopOnError !== false ? " checked" : "") + ">出错即停</label></div>" +
         '<div class="yd-list">' + uniq.map((r) =>
           '<div class="yd-row"><input type="checkbox" data-tid="' + r.tid + '">' +
           '<span class="yd-t" title="' + r.text.replace(/"/g, "&quot;") + '">' + r.text.slice(0, 42) + "</span>" +
@@ -643,24 +706,37 @@ function injectUI() {
       panel._stop = false;
       panel.querySelector('[data-act=all]').onclick = () => panel.querySelectorAll('input[type=checkbox]').forEach((c) => (c.checked = true));
       panel.querySelector('[data-act=none]').onclick = () => panel.querySelectorAll('input[type=checkbox]').forEach((c) => (c.checked = false));
-      panel.querySelector('[data-act=stop]').onclick = () => { panel._stop = true; };
+      panel.querySelector('[data-act=stop]').onclick = () => { panel._stop = true; say(panel, "正在停止：当前帖完成后中止"); };
       panel.querySelector('[data-act=go]').onclick = async () => {
-        const cap = +panel.querySelector("[name=yd-cap]").value || 10;
+        const pf = +panel.querySelector("[name=yd-pf]").value;
+        const pt = +panel.querySelector("[name=yd-pt]").value;
+        cfg.stopOnError = panel.querySelector("[name=yd-soe]").checked; // 批量页区间不持久化，避免与单帖面板互相污染
         const bfmt = panel.querySelector('[name=yd-bfmt]:checked');
         if (bfmt) cfg.novelFormat = bfmt.value;
+        saveCfg();
+        const o = { panel, pageFrom: pf > 0 ? pf : 1, pageTo: pt > 0 ? pt : 0 };
         const picked = [...panel.querySelectorAll(".yd-row")].filter((r) => r.querySelector("input").checked)
           .map((r) => ({ tid: r.querySelector("input").dataset.tid, kind: r.querySelector("select").value, name: r.querySelector(".yd-t").textContent }));
+        panel._stop = false; // 每次开始重置停止标志
+        RUN.panel = panel;
         let okc = 0;
+        try {
         for (const [i, t] of picked.entries()) {
           if (panel._stop) { say(panel, "已停止"); break; }
           say(panel, "[" + (i + 1) + "/" + picked.length + "] 《" + t.name.slice(0, 20) + "》…");
           try {
-            if (t.kind === "manga") await runMangaThread(t.tid, { panel, pageCap: cap });
-            else { cfg.novelMode = "author"; await runNovelThread(t.tid, { panel, pageCap: cap }); }
+            if (t.kind === "manga") await runMangaThread(t.tid, o);
+            else { cfg.novelMode = "author"; await runNovelThread(t.tid, o); }
             okc++;
             await sleep(3000); // 帖间冷却
-          } catch (e) { say(panel, "跳过《" + t.name.slice(0, 16) + "》: " + String((e && e.message) || e)); await sleep(2000); }
+          } catch (e) {
+            if (isAbort(e)) { say(panel, "已停止"); break; }
+            say(panel, "跳过《" + t.name.slice(0, 16) + "》: " + String((e && e.message) || e));
+            if (cfg.stopOnError) { say(panel, "出错即停生效，队列中止（关掉勾选可让单帖失败自动跳过）"); break; }
+            await sleep(2000);
+          }
         }
+        } finally { RUN.panel = null; }
         say(panel, "队列结束，成功 " + okc + "/" + picked.length);
       };
     };
@@ -675,6 +751,6 @@ function el(tag, cls, text) {
 }
 
 /* ================= 入口 ================= */
-console.log("[yamibo-dl] v0.3.2 已加载，JSZip: " + (typeof JSZip === "function" ? "内置可用" : "缺失！"));
+console.log("[yamibo-dl] v0.3.3 已加载，JSZip: " + (typeof JSZip === "function" ? "内置可用" : "缺失！"));
 try { injectUI(); } catch (e) { console.error("[yamibo-dl] UI 初始化失败", e); }
 })();
